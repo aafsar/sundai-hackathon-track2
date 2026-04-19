@@ -21,7 +21,6 @@ __global__ void quantize_int4_kernel(
 
     if (row >= M) return;
 
-    int num_groups = K / group_size;
     int k_start = group * group_size;
 
     // Step 1: Find max absolute value in this group
@@ -34,7 +33,9 @@ __global__ void quantize_int4_kernel(
 
     // Step 2: Compute scale
     float scale = max_abs / 7.0f;
-    scales[row * num_groups + group] = __float2half(scale);
+    // Store scales group-major in the same [M, num_groups] allocation.
+    // GEMM reads the raw pointer as scales[group][row] for coalesced scale loads.
+    scales[group * M + row] = __float2half(scale);
 
     // Step 3: Compute reciprocal scale (guard against zero)
     float rscale = (max_abs > 0.0f) ? (7.0f / max_abs) : 0.0f;
@@ -88,60 +89,258 @@ std::vector<torch::Tensor> quantize_int4_custom(torch::Tensor input, int group_s
 
 // INT4 GEMM Kernel
 
-// Computes C[M, N] = A[M, K] @ B[N, K]^T where A and B are packed INT4 with per-group scales.
-// Each thread computes one output element.
-// Within each group, INT4 dot product is accumulated in int32, then scaled to FP32.
-__global__ void gemm_int4_kernel(
-    const uint8_t* __restrict__ A,        // [M, K/2] packed INT4 activations
-    const uint8_t* __restrict__ B,        // [N, K/2] packed INT4 weights
-    const half* __restrict__ scales_A,    // [M, num_groups]
-    const half* __restrict__ scales_B,    // [N, num_groups]
-    half* __restrict__ C,                 // [M, N] output
-    int M,
-    int N,
-    int K,
-    int group_size
-) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
+// ---- MMA configuration ----
+static constexpr int BLOCK_M   = 128;
+static constexpr int BLOCK_N   = 128;
+static constexpr int BLOCK_K   = 64;
+static constexpr int WARP_SZ   = 32;
+static constexpr int NUM_WARPS = 8;
+static constexpr int WARP_M    = BLOCK_M / NUM_WARPS;
+static constexpr int TILES_N   = BLOCK_N / 16;
 
-    if (row >= M || col >= N) return;
+// One 64-wide INT4 K tile is 32 packed bytes. Padding avoids shared-memory
+// bank conflicts while keeping cp.async destinations 16-byte aligned.
+static constexpr int SMEM_STRIDE = BLOCK_K / 2 + 16;
 
-    int num_groups = K / group_size;
-    int half_group = group_size / 2;  // number of packed bytes per group
+__device__ __forceinline__ void mma_s4(uint4 a, uint2 b, int (&c)[4]) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b.x), "r"(b.y));
+#else
+    asm volatile("{"
+        ".reg .b32 t0,t1,t2,t3;\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {t0,t1},{%4},{%8},{%0,%1};\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {t2,t3},{%5},{%8},{%2,%3};\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%0,%1},{%6},{%9},{t0,t1};\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%2,%3},{%7},{%9},{t2,t3};\n"
+        "}\n"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b.x), "r"(b.y));
+#endif
+}
 
-    float acc = 0.0f;
+__device__ __forceinline__ void cp_async_16(void *dst, const void *src, bool pred) {
+    unsigned s = __cvta_generic_to_shared(dst);
+    asm volatile(
+        "{ .reg .pred p; setp.ne.b32 p,%2,0;\n"
+        "  @p cp.async.ca.shared.global [%0],[%1],16;\n"
+        "  @!p st.shared.v4.u32 [%0],{0,0,0,0}; }\n"
+        :: "r"(s), "l"(src), "r"((int)pred));
+}
 
-    for (int g = 0; g < num_groups; g++) {
-        float sa = __half2float(scales_A[row * num_groups + g]);
-        float sb = __half2float(scales_B[col * num_groups + g]);
+__device__ __forceinline__ void cp_async_16_always(void *dst, const void *src) {
+    unsigned s = __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.ca.shared.global [%0],[%1],16;\n" :: "r"(s), "l"(src));
+}
 
-        int dot = 0;
-        int byte_base = g * half_group;
+__device__ __forceinline__ void cp_commit() {
+    asm volatile("cp.async.commit_group;\n");
+}
 
-        for (int b = 0; b < half_group; b++) {
-            uint8_t a_packed = A[row * (K / 2) + byte_base + b];
-            uint8_t b_packed = B[col * (K / 2) + byte_base + b];
+__device__ __forceinline__ void cp_wait(int n) {
+    if (n == 0) {
+        asm volatile("cp.async.wait_group 0;\n");
+    } else {
+        asm volatile("cp.async.wait_group 1;\n");
+    }
+}
 
-            // Unpack low nibble (even element) with sign extension
-            int a_lo = (int)(a_packed & 0xF);
-            if (a_lo >= 8) a_lo -= 16;
-            int b_lo = (int)(b_packed & 0xF);
-            if (b_lo >= 8) b_lo -= 16;
+__device__ __forceinline__ uint4 load_a_frag(const uint8_t *base, int stride) {
+    int lane = threadIdx.x % WARP_SZ;
+    int row_lo = lane / 4;
+    int row_hi = row_lo + 8;
+    int col = (lane % 4) * 4;
 
-            // Unpack high nibble (odd element) with sign extension
-            int a_hi = (int)((a_packed >> 4) & 0xF);
-            if (a_hi >= 8) a_hi -= 16;
-            int b_hi = (int)((b_packed >> 4) & 0xF);
-            if (b_hi >= 8) b_hi -= 16;
+    uint4 a;
+    a.x = *(const uint32_t*)(base + row_lo * stride + col);
+    a.y = *(const uint32_t*)(base + row_hi * stride + col);
+    a.z = *(const uint32_t*)(base + row_lo * stride + 16 + col);
+    a.w = *(const uint32_t*)(base + row_hi * stride + 16 + col);
+    return a;
+}
 
-            dot += a_lo * b_lo + a_hi * b_hi;
+__device__ __forceinline__ uint2 load_b_frag(const uint8_t *base, int stride) {
+    int lane = threadIdx.x % WARP_SZ;
+    int row = lane / 4;
+    int col = (lane % 4) * 4;
+
+    uint2 b;
+    b.x = *(const uint32_t*)(base + row * stride + col);
+    b.y = *(const uint32_t*)(base + row * stride + 16 + col);
+    return b;
+}
+
+template <bool FAST_PATH>
+__global__ void gemm_int4_mma_kernel(
+    const uint8_t *__restrict__ A,
+    const uint8_t *__restrict__ B,
+    const half *__restrict__ scales_A,
+    const half *__restrict__ scales_B,
+    half *__restrict__ C,
+    int M, int N, int K, int group_size)
+{
+    const int bm = blockIdx.y * BLOCK_M;
+    const int bn = blockIdx.x * BLOCK_N;
+    const int tid = threadIdx.x;
+    const int warpId = tid / WARP_SZ;
+    const int laneId = tid % WARP_SZ;
+    const int halfK = K / 2;
+    const int num_k_tiles = K / BLOCK_K;
+
+    extern __shared__ uint8_t smem[];
+    const int tileA = BLOCK_M * SMEM_STRIDE;
+    const int tileB = BLOCK_N * SMEM_STRIDE;
+    uint8_t *sA0 = smem;
+    uint8_t *sB0 = smem + tileA;
+    uint8_t *sA1 = smem + tileA + tileB;
+    uint8_t *sB1 = sA1 + tileA;
+    uint8_t *sA[2] = {sA0, sA1};
+    uint8_t *sB[2] = {sB0, sB1};
+
+    float *sScaleA = reinterpret_cast<float*>(smem + 2 * (tileA + tileB));
+    float *sScaleB = sScaleA + BLOCK_M;
+
+    float acc[TILES_N][2][4];
+    #pragma unroll
+    for (int nt = 0; nt < TILES_N; nt++) {
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            acc[nt][h][0] = 0.f;
+            acc[nt][h][1] = 0.f;
+            acc[nt][h][2] = 0.f;
+            acc[nt][h][3] = 0.f;
         }
-
-        acc += sa * sb * (float)dot;
     }
 
-    C[row * N + col] = __float2half(acc);
+    auto load_tile = [&](int kt, int s) {
+        int kb = kt * (BLOCK_K / 2);
+
+        int a_row = tid / 2;
+        int a_half = tid & 1;
+        uint8_t *a_dst = sA[s] + a_row * SMEM_STRIDE + a_half * 16;
+        const uint8_t *a_src = A + (size_t)(bm + a_row) * halfK + kb + a_half * 16;
+
+        int b_row = tid / 2;
+        int b_half = tid & 1;
+        uint8_t *b_dst = sB[s] + b_row * SMEM_STRIDE + b_half * 16;
+        const uint8_t *b_src = B + (size_t)(bn + b_row) * halfK + kb + b_half * 16;
+
+        if (FAST_PATH) {
+            cp_async_16_always(a_dst, a_src);
+            cp_async_16_always(b_dst, b_src);
+        } else {
+            bool pa = (bm + a_row < M) && (kb + a_half * 16 < halfK);
+            bool pb = (bn + b_row < N) && (kb + b_half * 16 < halfK);
+            cp_async_16(a_dst, a_src, pa);
+            cp_async_16(b_dst, b_src, pb);
+        }
+        cp_commit();
+    };
+
+    auto load_scales = [&](int g) {
+        if (tid < BLOCK_M) {
+            int m = bm + tid;
+            sScaleA[tid] = (FAST_PATH || m < M) ? __half2float(scales_A[(size_t)g * M + m]) : 0.f;
+        }
+        if (tid < BLOCK_N) {
+            int n = bn + tid;
+            sScaleB[tid] = (FAST_PATH || n < N) ? __half2float(scales_B[(size_t)g * N + n]) : 0.f;
+        }
+    };
+
+    if (num_k_tiles > 0) {
+        load_tile(0, 0);
+    }
+
+    for (int kt = 0; kt < num_k_tiles; kt++) {
+        int s = kt & 1;
+        if (kt + 1 < num_k_tiles) {
+            load_tile(kt + 1, (kt + 1) & 1);
+        }
+
+        int g = (kt * BLOCK_K) / group_size;
+        load_scales(g);
+
+        cp_wait(kt + 1 < num_k_tiles ? 1 : 0);
+        __syncthreads();
+
+        int local_m_lo = warpId * WARP_M + laneId / 4;
+        int local_m_hi = local_m_lo + 8;
+        float sa_lo = sScaleA[local_m_lo];
+        float sa_hi = sScaleA[local_m_hi];
+
+        uint4 af = load_a_frag(sA[s] + warpId * WARP_M * SMEM_STRIDE, SMEM_STRIDE);
+
+        #pragma unroll
+        for (int nt = 0; nt < TILES_N; nt++) {
+            int n_off = nt * 16;
+
+            uint2 bf0 = load_b_frag(sB[s] + (n_off + 0) * SMEM_STRIDE, SMEM_STRIDE);
+            uint2 bf1 = load_b_frag(sB[s] + (n_off + 8) * SMEM_STRIDE, SMEM_STRIDE);
+
+            int p0[4] = {0, 0, 0, 0};
+            int p1[4] = {0, 0, 0, 0};
+            mma_s4(af, bf0, p0);
+            mma_s4(af, bf1, p1);
+
+            int local_c0 = n_off + (laneId % 4) * 2;
+            int local_c1 = local_c0 + 1;
+            int local_c2 = local_c0 + 8;
+            int local_c3 = local_c2 + 1;
+            float sb0 = sScaleB[local_c0];
+            float sb1 = sScaleB[local_c1];
+            float sb2 = sScaleB[local_c2];
+            float sb3 = sScaleB[local_c3];
+
+            acc[nt][0][0] = fmaf((float)p0[0], sa_lo * sb0, acc[nt][0][0]);
+            acc[nt][0][1] = fmaf((float)p0[1], sa_lo * sb1, acc[nt][0][1]);
+            acc[nt][0][2] = fmaf((float)p0[2], sa_hi * sb0, acc[nt][0][2]);
+            acc[nt][0][3] = fmaf((float)p0[3], sa_hi * sb1, acc[nt][0][3]);
+            acc[nt][1][0] = fmaf((float)p1[0], sa_lo * sb2, acc[nt][1][0]);
+            acc[nt][1][1] = fmaf((float)p1[1], sa_lo * sb3, acc[nt][1][1]);
+            acc[nt][1][2] = fmaf((float)p1[2], sa_hi * sb2, acc[nt][1][2]);
+            acc[nt][1][3] = fmaf((float)p1[3], sa_hi * sb3, acc[nt][1][3]);
+        }
+        __syncthreads();
+    }
+
+    int m_lo = bm + warpId * WARP_M + laneId / 4;
+    int m_hi = m_lo + 8;
+
+    #pragma unroll
+    for (int nt = 0; nt < TILES_N; nt++) {
+        int c0 = bn + nt * 16 + (laneId % 4) * 2;
+        int c1 = c0 + 1;
+        int c2 = c0 + 8;
+        int c3 = c2 + 1;
+
+        if (FAST_PATH) {
+            *(reinterpret_cast<half2*>(C + (size_t)m_lo * N + c0)) =
+                __halves2half2(__float2half(acc[nt][0][0]), __float2half(acc[nt][0][1]));
+            *(reinterpret_cast<half2*>(C + (size_t)m_lo * N + c2)) =
+                __halves2half2(__float2half(acc[nt][1][0]), __float2half(acc[nt][1][1]));
+            *(reinterpret_cast<half2*>(C + (size_t)m_hi * N + c0)) =
+                __halves2half2(__float2half(acc[nt][0][2]), __float2half(acc[nt][0][3]));
+            *(reinterpret_cast<half2*>(C + (size_t)m_hi * N + c2)) =
+                __halves2half2(__float2half(acc[nt][1][2]), __float2half(acc[nt][1][3]));
+        } else {
+            if (m_lo < M) {
+                if (c0 < N) C[(size_t)m_lo * N + c0] = __float2half(acc[nt][0][0]);
+                if (c1 < N) C[(size_t)m_lo * N + c1] = __float2half(acc[nt][0][1]);
+                if (c2 < N) C[(size_t)m_lo * N + c2] = __float2half(acc[nt][1][0]);
+                if (c3 < N) C[(size_t)m_lo * N + c3] = __float2half(acc[nt][1][1]);
+            }
+            if (m_hi < M) {
+                if (c0 < N) C[(size_t)m_hi * N + c0] = __float2half(acc[nt][0][2]);
+                if (c1 < N) C[(size_t)m_hi * N + c1] = __float2half(acc[nt][0][3]);
+                if (c2 < N) C[(size_t)m_hi * N + c2] = __float2half(acc[nt][1][2]);
+                if (c3 < N) C[(size_t)m_hi * N + c3] = __float2half(acc[nt][1][3]);
+            }
+        }
+    }
 }
 
 torch::Tensor gemm_int4_custom(
@@ -164,20 +363,40 @@ torch::Tensor gemm_int4_custom(
 
     TORCH_CHECK(B_packed.size(1) * 2 == K, "A and B must have the same K dimension");
     TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
+    TORCH_CHECK(group_size >= BLOCK_K && group_size % BLOCK_K == 0,
+                "MMA path expects group_size to be a multiple of 64");
 
     auto C = torch::empty({M, N}, torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
 
-    dim3 block(16, 16);
-    dim3 grid((N + 15) / 16, (M + 15) / 16);
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    dim3 block(WARP_SZ * NUM_WARPS);
+    int smem = 2 * (BLOCK_M * SMEM_STRIDE + BLOCK_N * SMEM_STRIDE)
+             + (BLOCK_M + BLOCK_N) * (int)sizeof(float);
 
-    gemm_int4_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        A_packed.data_ptr<uint8_t>(),
-        B_packed.data_ptr<uint8_t>(),
-        reinterpret_cast<const half*>(scales_A.data_ptr<at::Half>()),
-        reinterpret_cast<const half*>(scales_B.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(C.data_ptr<at::Half>()),
-        M, N, K, group_size
-    );
+    const bool fast_path = (group_size == BLOCK_K) &&
+                           (M % BLOCK_M == 0) &&
+                           (N % BLOCK_N == 0) &&
+                           (K % BLOCK_K == 0);
+
+    if (fast_path) {
+        gemm_int4_mma_kernel<true><<<grid, block, smem, at::cuda::getCurrentCUDAStream()>>>(
+            A_packed.data_ptr<uint8_t>(),
+            B_packed.data_ptr<uint8_t>(),
+            reinterpret_cast<const half*>(scales_A.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(scales_B.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(C.data_ptr<at::Half>()),
+            M, N, K, group_size
+        );
+    } else {
+        gemm_int4_mma_kernel<false><<<grid, block, smem, at::cuda::getCurrentCUDAStream()>>>(
+            A_packed.data_ptr<uint8_t>(),
+            B_packed.data_ptr<uint8_t>(),
+            reinterpret_cast<const half*>(scales_A.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(scales_B.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(C.data_ptr<at::Half>()),
+            M, N, K, group_size
+        );
+    }
 
     return C;
 }

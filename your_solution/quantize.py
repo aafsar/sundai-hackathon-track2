@@ -53,7 +53,10 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     odd = ((q[:, 1::2] & 0xF) << 4).to(torch.uint8)
     packed = odd | even  # [N, K//2]
 
-    scales = scale.squeeze(-1).half()  # [N, num_groups]
+    # Keep the public shape [N, num_groups], but store the contiguous buffer as
+    # group-major [num_groups, N]. The CUDA GEMM reads raw memory as
+    # scales[group * N + row] so each CTA can load 128 adjacent scales.
+    scales = scale.squeeze(-1).half().transpose(0, 1).contiguous().view(N, num_groups)
 
     return {
         "weight_packed": packed,
