@@ -112,25 +112,17 @@ __global__ void gemm_int4_kernel(
 
     float acc = 0.0f;
 
-    int packed_K = K / 2;
-    int a_row_base = row * packed_K;
-    int b_row_base = col * packed_K;
-    int scale_a_base = row * num_groups;
-    int scale_b_base = col * num_groups;
-
     for (int g = 0; g < num_groups; g++) {
-        float sa = __half2float(scales_A[scale_a_base + g]);
-        float sb = __half2float(scales_B[scale_b_base + g]);
+        float sa = __half2float(scales_A[row * num_groups + g]);
+        float sb = __half2float(scales_B[col * num_groups + g]);
 
         int dot = 0;
         int byte_base = g * half_group;
 
-        const uint8_t* a_group = A + a_row_base + byte_base;
-        const uint8_t* b_group = B + b_row_base + byte_base;
-
         for (int b = 0; b < half_group; b++) {
-            uint8_t a_packed = a_group[b];
-            uint8_t b_packed = b_group[b];
+            uint8_t a_packed = A[row * (K / 2) + byte_base + b];
+            uint8_t b_packed = B[col * (K / 2) + byte_base + b];
+
             // Unpack low nibble (even element) with sign extension
             int a_lo = (int)(a_packed & 0xF);
             if (a_lo >= 8) a_lo -= 16;

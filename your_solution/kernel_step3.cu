@@ -88,10 +88,59 @@ std::vector<torch::Tensor> quantize_int4_custom(torch::Tensor input, int group_s
 
 // INT4 GEMM Kernel
 
+// ---- Configuration ----
+static constexpr int BLOCK_M   = 128;
+static constexpr int BLOCK_N   = 128;
+static constexpr int BLOCK_K   = 64;  // one quantization group per K-step
+static constexpr int WARP_SZ   = 32;
+static constexpr int NUM_WARPS = 8;
+static constexpr int WARP_M    = BLOCK_M / NUM_WARPS;  // 16
+static constexpr int TILES_N   = BLOCK_N / 16;         // 8 (16-col tiles)
+
+// Shared memory stride: K/2 bytes + padding (must be 16-byte aligned for cp.async)
+static constexpr int SMEM_STRIDE = BLOCK_K / 2 + 16;   // 48 bytes per row
+
+// ---- MMA wrapper: m16n8k64 INT4×INT4 → INT32 ----
+__device__ __forceinline__ void mma_s4(uint4 a, uint2 b, int (&c)[4]) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+        : "+r"(c[0]),"+r"(c[1]),"+r"(c[2]),"+r"(c[3])
+        : "r"(a.x),"r"(a.y),"r"(a.z),"r"(a.w),"r"(b.x),"r"(b.y));
+#else
+    asm volatile("{"
+        ".reg .b32 t0,t1,t2,t3;\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {t0,t1},{%4},{%8},{%0,%1};\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {t2,t3},{%5},{%8},{%2,%3};\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%0,%1},{%6},{%9},{t0,t1};\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%2,%3},{%7},{%9},{t2,t3};\n"
+        "}\n"
+        : "+r"(c[0]),"+r"(c[1]),"+r"(c[2]),"+r"(c[3])
+        : "r"(a.x),"r"(a.y),"r"(a.z),"r"(a.w),"r"(b.x),"r"(b.y));
+#endif
+}
+
+
+// ---- cp.async: 16-byte async global→shared copy ----
+__device__ __forceinline__ void cp_async_16(void *dst, const void *src, bool pred) {
+    unsigned s = __cvta_generic_to_shared(dst);
+    asm volatile(
+        "{ .reg .pred p; setp.ne.b32 p,%2,0;\n"
+        "  @p cp.async.ca.shared.global [%0],[%1],16;\n"
+        "  @!p st.shared.v4.u32 [%0],{0,0,0,0}; }\n"
+        :: "r"(s),"l"(src),"r"((int)pred));
+}
+__device__ __forceinline__ void cp_commit()  { asm volatile("cp.async.commit_group;\n"); }
+__device__ __forceinline__ void cp_wait(int n) {
+    if (n == 0) asm volatile("cp.async.wait_group 0;\n");
+    else        asm volatile("cp.async.wait_group 1;\n");
+}
+
 // Computes C[M, N] = A[M, K] @ B[N, K]^T where A and B are packed INT4 with per-group scales.
 // Each thread computes one output element.
 // Within each group, INT4 dot product is accumulated in int32, then scaled to FP32.
-__global__ void gemm_int4_kernel(
+__global__ void gemm_int4_naive_kernel(
     const uint8_t* __restrict__ A,        // [M, K/2] packed INT4 activations
     const uint8_t* __restrict__ B,        // [N, K/2] packed INT4 weights
     const half* __restrict__ scales_A,    // [M, num_groups]
@@ -112,25 +161,17 @@ __global__ void gemm_int4_kernel(
 
     float acc = 0.0f;
 
-    int packed_K = K / 2;
-    int a_row_base = row * packed_K;
-    int b_row_base = col * packed_K;
-    int scale_a_base = row * num_groups;
-    int scale_b_base = col * num_groups;
-
     for (int g = 0; g < num_groups; g++) {
-        float sa = __half2float(scales_A[scale_a_base + g]);
-        float sb = __half2float(scales_B[scale_b_base + g]);
+        float sa = __half2float(scales_A[row * num_groups + g]);
+        float sb = __half2float(scales_B[col * num_groups + g]);
 
         int dot = 0;
         int byte_base = g * half_group;
 
-        const uint8_t* a_group = A + a_row_base + byte_base;
-        const uint8_t* b_group = B + b_row_base + byte_base;
-
         for (int b = 0; b < half_group; b++) {
-            uint8_t a_packed = a_group[b];
-            uint8_t b_packed = b_group[b];
+            uint8_t a_packed = A[row * (K / 2) + byte_base + b];
+            uint8_t b_packed = B[col * (K / 2) + byte_base + b];
+
             // Unpack low nibble (even element) with sign extension
             int a_lo = (int)(a_packed & 0xF);
             if (a_lo >= 8) a_lo -= 16;
@@ -178,7 +219,7 @@ torch::Tensor gemm_int4_custom(
     dim3 block(16, 16);
     dim3 grid((N + 15) / 16, (M + 15) / 16);
 
-    gemm_int4_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+    gemm_int4_naive_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         A_packed.data_ptr<uint8_t>(),
         B_packed.data_ptr<uint8_t>(),
         reinterpret_cast<const half*>(scales_A.data_ptr<at::Half>()),
